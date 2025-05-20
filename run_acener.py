@@ -525,8 +525,7 @@ def train(args, model, tokenizer):
             optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
         )
 
-    if args.fp16:
-        scaler = GradScaler()
+    scaler = GradScaler(enabled=args.fp16)
     # ori_model = model
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
@@ -579,70 +578,67 @@ def train(args, model, tokenizer):
                 inputs['mention_pos'] = batch[4]
             if args.use_full_layer!=-1:
                 inputs['full_attention_mask']= batch[5]
-            float_type = torch.float16 if args.fp16 else torch.float32
-            with autocast(dtype=float_type):
+
+            with autocast('cuda', dtype=torch.float16, enabled=args.fp16):
                 outputs = model(**inputs)
                 loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
                 if args.n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu parallel training
                 loss = loss / args.gradient_accumulation_steps
-                scaler.scale(loss).backward()
-
                 tr_loss += loss.item()
 
+            scaler.scale(loss).backward()
 
-                if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
-                    if args.max_grad_norm > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    scaler.step(optimizer)
-                    old_scale = scaler.get_scale()
-                    scaler.update() #replacement for optimizer.step()
-                    new_scale = scaler.get_scale()
 
-                    if new_scale == old_scale:
-                        scheduler.step()  # Update learning rate schedule
-                    optimizer.zero_grad()
-                    global_step += 1
+            if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
+                if args.max_grad_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scaler.step(optimizer)
+                old_scale = scaler.get_scale()
+                scaler.update() #replacement for optimizer.step()
+                new_scale = scaler.get_scale()
 
-                    if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                if new_scale == old_scale:
+                    scheduler.step()  # Update learning rate schedule
+                optimizer.zero_grad()
+                global_step += 1
+
+                # Log metrics
+                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    metrics_to_log = {
+                        "train/lr": scheduler.get_lr()[0],
+                        "train/loss": (tr_loss - logging_loss)/args.logging_steps,
+                    }
+                    wandb.log(metrics_to_log, global_step)
+                    logging_loss = tr_loss
+
+
+                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                    update = True
+                    # Save model checkpoint
+                    if args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                        results = evaluate(args, model, tokenizer)
+                        f1 = results['f1']
+                        print(results)
                         # Log metrics
                         metrics_to_log = {
-                            "train/lr": scheduler.get_lr()[0],
-                            "train/loss": (tr_loss - logging_loss)/args.logging_steps,
+                            "dev/f1": results["f1"],
+                            "dev/precision": results["precision"],
+                            "dev/recall": results["recall"],
                         }
                         wandb.log(metrics_to_log, global_step)
 
-                        #tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                        #tb_writer.add_scalar('loss', global_step)
-                        logging_loss = tr_loss
+                        #tb_writer.add_scalar('f1', f1, global_step)
 
+                        if f1 > best_f1:
+                            best_f1 = f1
+                            print ('Best F1', best_f1)
+                        else:
+                            update = False
 
-                    if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                        update = True
-                        # Save model checkpoint
-                        if args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                            results = evaluate(args, model, tokenizer)
-                            f1 = results['f1']
-                            print(results)
-                            # Log metrics
-                            metrics_to_log = {
-                                "dev/f1": results["f1"],
-                                "dev/precision": results["precision"],
-                                "dev/recall": results["recall"],
-                            }
-                            wandb.log(metrics_to_log, global_step)
-
-                            #tb_writer.add_scalar('f1', f1, global_step)
-
-                            if f1 > best_f1:
-                                best_f1 = f1
-                                print ('Best F1', best_f1)
-                            else:
-                                update = False
-
-                        if update:
-                            _save_checkpoint(args, model, epoch, global_step, optimizer, scheduler, scaler, best_f1)
+                    if update:
+                        _save_checkpoint(args, model, epoch, global_step, optimizer, scheduler, scaler, best_f1)
 
                 if args.max_steps > 0 and global_step > args.max_steps:
                     epoch_iterator.close()
