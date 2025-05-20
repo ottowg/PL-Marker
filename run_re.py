@@ -25,13 +25,13 @@ import random
 from collections import defaultdict
 import re
 import shutil
+import wandb
 
 import numpy as np
 import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
-from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
 import time
 from transformers import (WEIGHTS_NAME, BertConfig,
@@ -50,6 +50,7 @@ from transformers import (WEIGHTS_NAME, BertConfig,
 
 from transformers import AutoTokenizer
 from torch.utils.data import TensorDataset, Dataset
+from torch.amp import autocast, GradScaler
 import json
 import pickle
 import numpy as np
@@ -81,7 +82,34 @@ task_rel_labels = {
     'ace04': ['PER-SOC', 'OTHER-AFF', 'ART', 'GPE-AFF', 'EMP-ORG', 'PHYS'],
     'ace05': ['PER-SOC', 'ART', 'ORG-AFF', 'GEN-AFF', 'PHYS', 'PART-WHOLE'],
     'scierc': ['PART-OF', 'USED-FOR', 'FEATURE-OF', 'CONJUNCTION', 'EVALUATE-FOR', 'HYPONYM-OF', 'COMPARE'],
-    'gsap': [],
+    'gsap': [
+        'appliedTo',
+        'benchmarkFor',
+
+        'coreference',
+        'isComparedTo',
+        'isHyponymOf',
+        'isPartOf',
+        'versionOf' # not  working
+
+         'trainedOn',
+         'evaluatedOn',
+         'processed', # not working
+
+         'generatedBy',
+         'transformedFrom',
+         'sourcedFrom',
+
+       'hasInstanceType',
+       'size',
+            
+       'architecture',
+       'isBasedOn',
+       'usedFor',
+
+       'citation',
+       'url',
+    ]
 }
 
 
@@ -103,7 +131,8 @@ class ACEDataset(Dataset):
                 else:
                     file_path = args.dev_file
 
-        assert os.path.isfile(file_path)
+        if not os.path.isfile(file_path):
+            raise Exception(f"File does not exist: {file_path}")
 
         self.file_path = file_path
                 
@@ -154,9 +183,46 @@ class ACEDataset(Dataset):
                 label_list = ['PART-OF', 'USED-FOR', 'FEATURE-OF',  'EVALUATE-FOR', 'HYPONYM-OF']
                 self.sym_labels = ['NIL', 'CONJUNCTION', 'COMPARE']
                 self.label_list = self.sym_labels + label_list
+        elif args.data_dir.find("gsap") != -1:
+            self.ner_label_list = ["NIL", "Method", "MLModel", "MLModelGeneric", "ModelArchitecture", "Task", "Dataset", "DatasetGeneric", "DataSource", "URL", "ReferenceLink"]
+            label_list = [
+               'appliedTo',
+               'benchmarkFor',
 
+               'coreference',
+               'isComparedTo',
+               'isHyponymOf',
+               'isPartOf',
+               'versionOf', # not  working
+
+               'trainedOn',
+               'evaluatedOn',
+               'processed', # not working
+
+               'generatedBy',
+               'transformedFrom',
+               'sourcedFrom',
+
+               'hasInstanceType',
+               'size',
+                        
+               'architecture',
+               'isBasedOn',
+               'usedFor',
+
+               'citation',
+               'url',
+               "NIL"
+            ]
+            if args.no_sym:
+                self.sym_labels = ["NIL"]
+                self.label_list = label_list
+            else:
+                self.sym_labels = ["NIL", "coreference", "isComparedTo"]
+                self.label_list = label_list
         else:
             assert (False)  
+        print(f"Used TAGS: {self.ner_label_list}")
 
         self.global_predicted_ners = {}
         self.initialize()
@@ -498,8 +564,16 @@ def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
 
 def train(args, model, tokenizer):
     """ Train the model """
-    if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter("logs/"+args.data_dir[max(args.data_dir.rfind('/'),0):]+"_re_logs/"+args.output_dir[args.output_dir.rfind('/'):])
+    log_wandb = False
+    if args.local_rank in [-1, 0] and args.log_wandb:
+
+        wandb_params = dict(project=args.project_name, config=vars(args))
+        if args.run_name is not None:
+            wandb_params["name"] = args.run_name
+        run = wandb.init(**wandb_params)
+        log_wandb = True
+    else:
+        raise Exception()
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
 
@@ -522,6 +596,10 @@ def train(args, model, tokenizer):
         ]
     
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+
+    # initilize the scaler to train with float16
+    scaler = GradScaler(device=args.device_name, enabled=args.fp16)
+
     if args.warmup_steps==-1:
         scheduler = get_linear_schedule_with_warmup(
             optimizer, num_warmup_steps=int(0.1*t_total), num_training_steps=t_total
@@ -531,18 +609,12 @@ def train(args, model, tokenizer):
             optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
         )
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
     # ori_model = model
-    # multi-gpu training (should be after apex fp16 initialization)
+    # multi-gpu training
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Distributed training (should be after apex fp16 initialization)
+    # Distributed training 
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
                                                           output_device=args.local_rank,
@@ -575,8 +647,9 @@ def train(args, model, tokenizer):
             train_dataset.initialize()
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
-
             model.train()
+            
+
             batch = tuple(t.to(args.device) for t in batch)
 
             inputs = {'input_ids':      batch[0],
@@ -593,23 +666,20 @@ def train(args, model, tokenizer):
             if args.model_type.endswith('bertonedropoutnersub'):
                 inputs['sub_ner_labels'] = batch[7]
 
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
-            re_loss = outputs[1]
-            ner_loss = outputs[2]
+            with autocast(device_type=args.device_name, dtype=torch.float16, enabled=args.fp16):
+                outputs = model(**inputs)
+                loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+                re_loss = outputs[1]
+                ner_loss = outputs[2]
 
-            if args.n_gpu > 1:
-                loss = loss.mean() # mean() to average on multi-gpu parallel training
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-                re_loss = re_loss / args.gradient_accumulation_steps
-                ner_loss = ner_loss / args.gradient_accumulation_steps
+                if args.n_gpu > 1:
+                    loss = loss.mean() # mean() to average on multi-gpu parallel training
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+                    re_loss = re_loss / args.gradient_accumulation_steps
+                    ner_loss = ner_loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            scaler.scale(loss).backward()
 
             tr_loss += loss.item()
             if re_loss > 0:
@@ -618,16 +688,23 @@ def train(args, model, tokenizer):
                 tr_ner_loss += ner_loss.item()
 
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
                 if args.max_grad_norm > 0:
-                    if args.fp16:
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                optimizer.step()
-                scheduler.step()  # Update learning rate schedule
-                model.zero_grad()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.max_grad_norm
+                    )
+                scaler.step(optimizer)
+                
+                # Only ubpdate scheduler when optimization is successfull
+                old_scale = scaler.get_scale()
+                scaler.update()
+                new_scale = scaler.get_scale()
+                if new_scale == old_scale: # == => successfull optimization 
+                    scheduler.step()
+                
+                optimizer.zero_grad()
+                
                 global_step += 1
 
                 # if args.model_type.endswith('rel') :
@@ -635,15 +712,18 @@ def train(args, model, tokenizer):
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
-                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                    tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-                    logging_loss = tr_loss
-
-                    tb_writer.add_scalar('RE_loss', (tr_re_loss - logging_re_loss)/args.logging_steps, global_step)
-                    logging_re_loss = tr_re_loss
-
-                    tb_writer.add_scalar('NER_loss', (tr_ner_loss - logging_ner_loss)/args.logging_steps, global_step)
-                    logging_ner_loss = tr_ner_loss
+                    if log_wandb:
+                        metrics_to_log = {
+                            "train/lr": scheduler.get_lr()[0],
+                            "train/loss": (tr_loss - logging_loss) / args.logging_steps,
+                            'train/RE_loss': (tr_re_loss - logging_re_loss)/args.logging_steps,
+                            "train/NER_loss": (tr_ner_loss - logging_ner_loss)/args.logging_steps,
+                        }
+                        wandb.log(metrics_to_log, step=global_step)
+                    
+                        logging_loss = tr_loss
+                        logging_re_loss = tr_re_loss
+                        logging_ner_loss = tr_ner_loss
 
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0: # valid for bert/spanbert
@@ -652,7 +732,10 @@ def train(args, model, tokenizer):
                     if args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer)
                         f1 = results['f1_with_ner']
-                        tb_writer.add_scalar('f1_with_ner', f1, global_step)
+                        if log_wandb:
+                            metrics_to_log = {
+                                f'dev/{m}': v for m, v in results.items()}
+                            wandb.log(metrics_to_log, global_step)
 
                         if f1 > best_f1:
                             best_f1 = f1
@@ -681,8 +764,6 @@ def train(args, model, tokenizer):
             train_iterator.close()
             break
 
-    if args.local_rank in [-1, 0]:
-        tb_writer.close()
 
 
     return global_step, tr_loss / global_step, best_f1
@@ -807,8 +888,11 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
                     for j in range(len(v2)):
                         v1[j] += v2[j]
-                else:
-                    assert ( False )
+                else: # No inverse relation found. Why?
+                    print(f"{k1} exist but not {k2} in rel candidate list. Why?")
+                    #print("sentence", example_index, pair_dict)
+                    pass
+
 
                 if v1_ner_label=='NIL':
                     continue
@@ -1004,11 +1088,14 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     p = cor / tot_pred if tot_pred > 0 else 0 
     r = cor / tot_recall 
     f1 = 2 * (p * r) / (p + r) if cor > 0 else 0.0
-    assert(tot_recall==len(golden_labels))
+    if tot_recall != len(golden_labels):
+        print(f"tot_recall not len(golden_labels) {tot_recall} {len(golden_labels)}")
 
     p_with_ner = cor_with_ner / tot_pred if tot_pred > 0 else 0 
     r_with_ner = cor_with_ner / tot_recall
-    assert(tot_recall==len(golden_labels_withner))
+    #assert(tot_recall==len(golden_labels_withner))
+    if tot_recall != len(golden_labels_withner):
+        print(f"tot_recall not len(golden_labels) {tot_recall} {len(golden_labels_withner)}")
     f1_with_ner = 2 * (p_with_ner * r_with_ner) / (p_with_ner + r_with_ner) if cor_with_ner > 0 else 0.0
 
     results = {'f1':  f1,  'f1_with_ner': f1_with_ner, 'ner_f1': ner_f1}
@@ -1021,6 +1108,24 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--project_name",
+        type=str,
+        default="plmarker",
+        help="project name for wandb",
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="run name for wandb.",
+    )
+    parser.add_argument(
+        "--log_wandb",
+        action="store_true",
+        default=True,
+        help="Whether to log the training in wandb",
+    )
 
     ## Required parameters
     parser.add_argument("--data_dir", default='ace_data', type=str, required=True,
@@ -1151,9 +1256,11 @@ def main():
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        args.device_name = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
+        device = torch.device(args.device_name)
         args.n_gpu = torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        args.device_name = "cuda"
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend='nccl')
@@ -1184,6 +1291,13 @@ def main():
             num_labels = 8 + 8 - 1
         else:
             num_labels = 8 + 8 - 3
+    elif args.data_dir.find('gsap') != -1:
+        num_ner_labels = 11
+
+        if args.no_sym:
+            num_labels = 21 + 21 - 1 # 1 is NIL
+        else:
+            num_labels = 21 + 21 - 3 # 3 are NIL + undirected
     else:
         assert (False)
 

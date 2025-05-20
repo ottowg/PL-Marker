@@ -26,6 +26,7 @@ from collections import defaultdict
 import re
 import shutil
 import time
+from pathlib import Path
 
 import wandb
 
@@ -795,11 +796,9 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
 
     if args.output_results:
+        fn = Path(eval_dataset.file_path).name
         f = open(eval_dataset.file_path)
-        if do_test:
-            output_w = open(os.path.join(args.output_dir, 'ent_pred_test.json'), 'w')  
-        else:
-            output_w = open(os.path.join(args.output_dir, 'ent_pred_dev.json'), 'w')  
+        output_w = open(os.path.join(args.output_dir, fn), 'w')
         for l_idx, line in enumerate(f):
             data = json.loads(line)
             num_sents = len(data['sentences'])
